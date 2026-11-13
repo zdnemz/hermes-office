@@ -90,7 +90,7 @@ async function main() {
     ws.send(JSON.stringify({ id, method, params }));
   });
 
-  const evaluate = async (expression) => {
+  const evaluate = pageEval = async (expression) => {
     const res = await send('Runtime.evaluate', {
       expression, awaitPromise: true, returnByValue: true,
     });
@@ -296,20 +296,27 @@ async function main() {
   return result.ok ? 0 : 1;
 }
 
-async function apiSnapshot(base) {
-  const res = await fetch(`${base}/api/agents`, { cache: 'no-store' });
-  return res.json();
+/* API dipanggil DARI halaman (cookie sesi + token CSRF milik halaman),
+   supaya probe tetap jalan di server yang memakai login. */
+let pageEval = null;
+
+async function apiSnapshot() {
+  return pageEval(`fetch('/api/agents', { cache: 'no-store', credentials: 'same-origin' }).then(r => r.json())`);
 }
 
 async function apiPost(path, payload) {
-  const res = await fetch(path, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload),
-  });
-  let body = null;
-  try { body = await res.json(); } catch { body = null; }
-  return { status: res.status, body };
+  const rel = new URL(path).pathname;
+  return pageEval(`(async () => {
+    const s = await fetch('/api/session', { credentials: 'same-origin' }).then(r => r.json());
+    const res = await fetch(${JSON.stringify(rel)}, {
+      method: 'POST', credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': s.csrf || '' },
+      body: ${JSON.stringify(JSON.stringify(payload))},
+    });
+    let body = null;
+    try { body = await res.json(); } catch (e) { body = null; }
+    return { status: res.status, body };
+  })()`);
 }
 
 function parse(argv) {

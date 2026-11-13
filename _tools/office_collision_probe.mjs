@@ -29,7 +29,7 @@ if (args.help) {
   console.log(`pemakaian: node office_collision_probe.mjs --url URL [opsi]
   --url URL            halaman yang diuji (wajib)
   --cdp HOST:PORT      endpoint debug Chrome (default 127.0.0.1:9222)
-  --seconds N          lama audit (default 18)
+  --seconds N          lama audit (default 60)
   --outdir DIR         folder output PNG + JSON
   --rooms a,b,c        ruangan yang difoto close-up (default research,content,operations,hrd,eng)
   --timeout MS         batas tunggu UI siap (default 25000)`);
@@ -41,7 +41,7 @@ if (!args.url) {
 }
 
 const cdpHost = args.cdp || '127.0.0.1:9222';
-const seconds = Number(args.seconds || 18);
+const seconds = Number(args.seconds || 60);
 const timeoutMs = Number(args.timeout || 25000);
 const outdir = args.outdir || 'outbox/office-collision-probe';
 const rooms = (args.rooms || 'research,content,operations,hrd,eng').split(',').filter(Boolean);
@@ -186,6 +186,9 @@ async function main() {
     violations.filter((v) => v.kind === 'di-dinding').length === 0,
     violations.filter((v) => v.kind === 'di-dinding').length === 0
       ? 'bersih' : JSON.stringify(violations.filter((v) => v.kind === 'di-dinding').slice(0, 5)));
+  const decor = violations.filter((v) => v.kind === 'di-dekor' || v.kind === 'di-perabot-rapat');
+  check(`audit ${samples} sampel: agent tidak pernah menembus dekor/perabot`,
+    decor.length === 0, decor.length === 0 ? 'bersih' : JSON.stringify(decor.slice(0, 5)));
   check('semua agent working mendarat di kursi (bukan di lorong)',
     violations.filter((v) => v.kind === 'bukan-di-kursi').length === 0 && arrived === forced.total,
     violations.filter((v) => v.kind === 'bukan-di-kursi').length === 0

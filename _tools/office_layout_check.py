@@ -224,76 +224,51 @@ def check() -> dict:
                 problems.append({"rule": "bukaan-terlalu-sempit",
                                  "detail": f"{r['id']} sisi {s}"})
 
-    # 7. edge navigasi tidak memotong dinding
-    nodes = office.NAV_NODES
-    for a_id, b_id in office.NAV_EDGES:
-        if a_id not in nodes or b_id not in nodes:
-            problems.append({"rule": "edge-node-hilang", "detail": f"{a_id}-{b_id}"})
-            continue
-        a = tuple(nodes[a_id])
-        b = tuple(nodes[b_id])
-        for r in walled:
-            for s in ("north", "south", "west", "east"):
-                if shared_side(r, s):
-                    continue
-                axis = "z" if s in ("north", "south") else "x"
-                val = side_value(r, s)
-                hit = seg_intersect_line(a, b, axis, val)
-                if hit is None:
-                    continue
-                lo, hi, _ = side_span(r, s)
-                if hit < lo - EPS or hit > hi + EPS:
-                    continue
-                gap = door_gap(r, s)
-                if gap and gap[0] - DOOR_MARGIN <= hit <= gap[1] + DOOR_MARGIN:
-                    continue
-                problems.append({
-                    "rule": "edge-memotong-dinding",
-                    "detail": f"{a_id}->{b_id} menabrak {r['id']} sisi {s} di {hit:.2f}",
-                })
+    # 7-9. tiap pintu membuka ke lantai koridor yang tersambung ke pintu
+    #      masuk gedung (grid 0.25 m: di dalam gedung, di luar ruangan
+    #      berdinding + jarak bebas 0.35 m dari dindingnya).
+    cell = 0.25
+    xs = [p[0] for p in poly]
+    zs = [p[1] for p in poly]
+    gx0, gz0 = min(xs), min(zs)
+    gnx, gnz = int((max(xs) - gx0) / cell) + 1, int((max(zs) - gz0) / cell) + 1
+    blocked = [r for r in walled]
 
-    # 8. node navigasi di ruang kosong
-    room_of_node = {}
-    for r in rooms:
-        if r.get("nav", {}).get("door"):
-            room_of_node[r["nav"]["door"]] = r
-        if r.get("nav", {}).get("aisle"):
-            room_of_node[r["nav"]["aisle"]] = r
-    for node_id, (nx, nz) in nodes.items():
-        own = room_of_node.get(node_id)
-        for r in walled:
-            if r is own:
-                continue
-            if point_in_rect(nx, nz, room_rect(r)):
-                problems.append({"rule": "node-di-dalam-ruangan",
-                                 "detail": f"{node_id} di dalam {r['id']}"})
-        if own is not None:
-            rect = room_rect(own)
-            if own.get("door") and own["nav"].get("door") == node_id:
-                continue  # node pintu berdiri tepat di garis dinding
-            if not point_in_rect(nx, nz, rect):
-                problems.append({"rule": "aisle-di-luar-ruangan",
-                                 "detail": f"{node_id} milik {own['id']}"})
+    def free(i: int, j: int) -> bool:
+        x, z = gx0 + (i + 0.5) * cell, gz0 + (j + 0.5) * cell
+        if not point_in_polygon(x, z, poly):
+            return False
+        for r in blocked:
+            x0, x1, z0, z1 = room_rect(r)
+            if x0 - 0.35 < x < x1 + 0.35 and z0 - 0.35 < z < z1 + 0.35:
+                return False
+        return True
 
-    # 9. graph terhubung
-    adj: dict[str, list[str]] = {k: [] for k in nodes}
-    for a_id, b_id in office.NAV_EDGES:
-        if a_id in adj and b_id in adj:
-            adj[a_id].append(b_id)
-            adj[b_id].append(a_id)
+    def cell_of(x: float, z: float) -> tuple[int, int]:
+        return int((x - gx0) / cell), int((z - gz0) / cell)
+
+    ent = office.BUILDING.get("entrance") or {}
+    start = cell_of(ent.get("x", 0.0), ent.get("z", 0.0) - 0.9)
     seen = set()
-    if "entrance" in adj:
-        q = deque(["entrance"])
-        seen.add("entrance")
+    if 0 <= start[0] < gnx and 0 <= start[1] < gnz and free(*start):
+        seen.add(start)
+        q = deque([start])
         while q:
-            cur = q.popleft()
-            for nxt in adj[cur]:
-                if nxt not in seen:
-                    seen.add(nxt)
-                    q.append(nxt)
-    for node_id in nodes:
-        if node_id not in seen:
-            problems.append({"rule": "node-tidak-terhubung", "detail": node_id})
+            i, j = q.popleft()
+            for n in ((i + 1, j), (i - 1, j), (i, j + 1), (i, j - 1)):
+                if n not in seen and 0 <= n[0] < gnx and 0 <= n[1] < gnz and free(*n):
+                    seen.add(n)
+                    q.append(n)
+    else:
+        problems.append({"rule": "pintu-masuk-terhalang", "detail": str(ent)})
+    for r in walled:
+        d = r.get("door")
+        if not d:
+            continue
+        nx = {"east": 1, "west": -1}.get(d["side"], 0)
+        nz = {"south": 1, "north": -1}.get(d["side"], 0)
+        if cell_of(d["x"] + nx * 0.8, d["z"] + nz * 0.8) not in seen:
+            problems.append({"rule": "pintu-tidak-terjangkau", "detail": f"{r['id']} sisi {d['side']}"})
 
     # 10. semua agent punya meja
     for agent in office.LAYOUT_AGENTS:
@@ -305,12 +280,40 @@ def check() -> dict:
         "walled_rooms": len(walled),
         "agents": len(office.LAYOUT_AGENTS),
         "desks": sum(len(r["desks"]) for r in rooms),
-        "nav_nodes": len(nodes),
-        "nav_edges": len(office.NAV_EDGES),
-        "reachable_nodes": len(seen),
+        "floor_cells": len(seen),
         "problems": problems,
         "ok": not problems,
     }
+
+
+def editor_rules() -> list[dict]:
+    """Denah editor yang salah HARUS ditolak build_layout(strict=True), dan
+    denah bebas yang benar (ruangan baru jauh dari bawaan) harus diterima."""
+    import copy
+    base = office.default_rooms()
+    res = next(r for r in base if r["id"] == "research")
+    blocker = dict(res, id="blk", label="Blok", kind="empty", style="", dept="", desks=None,
+                   z=res["z"] + res["d"] / 2 + 2.25, w=6, d=4)
+    cases = [
+        ("menimpa", lambda r: r[1].update(x=r[2]["x"]), "menimpa"),
+        ("tanpa-rapat", lambda r: r.remove(next(x for x in r if x["kind"] == "meeting")), "ruang rapat"),
+        ("terpisah", lambda r: r.append(dict(r[1], id="far", label="Jauh", x=200, z=200)), "terlalu jauh"),
+        ("rapat-sempit", lambda r: next(x for x in r if x["kind"] == "meeting").update(w=8), "minimal"),
+        ("pintu-tertutup", lambda r: r.append(blocker), "tertutup"),
+        ("ruang-baru", lambda r: r.append(dict(blocker, id="new1", kind="department", z=-25, w=8, d=6)), None),
+    ]
+    problems = []
+    for name, mutate, expect in cases:
+        rooms = copy.deepcopy(base)
+        mutate(rooms)
+        try:
+            office.build_layout(office.ROSTER, dict(office.empty_custom(), rooms=rooms), strict=True)
+            err = None
+        except ValueError as exc:
+            err = str(exc)
+        if (expect is None) != (err is None) or (expect and expect not in err):
+            problems.append({"rule": "aturan-editor", "detail": f"{name}: harap {expect!r}, dapat {err!r}"})
+    return problems
 
 
 def main(argv=None) -> int:
@@ -319,27 +322,35 @@ def main(argv=None) -> int:
     parser.add_argument("--quiet", action="store_true", help="cetak ringkasan saja")
     args = parser.parse_args(argv)
 
-    result = check()
+    default = check()
+    office.use_layout(office.build_layout(office.stress_roster()))
+    stress = check()
+    office.use_layout(office.DEFAULT_LAYOUT)
+    stress["problems"] += editor_rules()
+    stress["ok"] = not stress["problems"]
+    for r, name in ((default, "bawaan"), (stress, "stress: meluap + 3 departemen baru")):
+        print(f"[{name}] masalah={len(r['problems'])}")
+    result = dict(stress, problems=default["problems"] + stress["problems"],
+                  ok=default["ok"] and stress["ok"], default=default)
     if args.json_path:
         Path(args.json_path).write_text(json.dumps(result, indent=2, ensure_ascii=False) + "\n",
                                         encoding="utf-8")
 
     if args.quiet:
         print(f"ruang={result['rooms']} meja={result['desks']} "
-              f"node={result['nav_nodes']} edge={result['nav_edges']} "
+              f"lantai={result['floor_cells']} sel "
               f"masalah={len(result['problems'])}")
     else:
         print(f"Denah: {result['rooms']} ruang ({result['walled_rooms']} berkunci), "
               f"{result['desks']} meja, {result['agents']} agent")
-        print(f"Navigasi: {result['nav_nodes']} node, {result['nav_edges']} edge, "
-              f"{result['reachable_nodes']} node terjangkau")
+        print(f"Lantai koridor: {result['floor_cells']} sel terjangkau dari pintu masuk")
         if result["problems"]:
             print(f"\nPELANGGARAN ({len(result['problems'])}):")
             for p in result["problems"][:40]:
                 print(f"  - {p['rule']}: {p['detail']}")
         else:
-            print("\nOK: tidak ada ruangan menimpa, tidak ada edge navigasi yang "
-                  "memotong dinding, semua node terjangkau, semua agent punya meja.")
+            print("\nOK: tidak ada ruangan menimpa, semua pintu terjangkau dari pintu "
+                  "masuk, semua agent punya meja.")
     return 0 if result["ok"] else 1
 
 

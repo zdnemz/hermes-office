@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import math
 import sys
 import time
@@ -33,64 +34,37 @@ import urllib.request
 from pathlib import Path
 
 
-class Checker:
-    def __init__(self, base: str):
-        self.base = base.rstrip("/")
-        self.results: list[tuple[bool, str, str]] = []
-        self.data: dict = {}
-
-    def check(self, name: str, condition: bool, detail: str = "") -> bool:
-        self.results.append((bool(condition), name, detail))
-        print(f"[{'PASS' if condition else 'FAIL'}] {name}" + (f" -- {detail}" if detail else ""))
-        return bool(condition)
-
-    def get(self, path: str):
-        req = urllib.request.Request(self.base + path, headers={"Accept": "*/*"})
-        try:
-            with urllib.request.urlopen(req, timeout=15) as res:
-                return res.status, res.read()
-        except urllib.error.HTTPError as exc:
-            return exc.code, exc.read()
-
-    def post(self, path: str, payload: dict):
-        body = json.dumps(payload).encode()
-        req = urllib.request.Request(
-            self.base + path, data=body,
-            headers={"Content-Type": "application/json"}, method="POST",
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=30) as res:
-                return res.status, res.read()
-        except urllib.error.HTTPError as exc:
-            return exc.code, exc.read()
-
-    @staticmethod
-    def json_of(raw: bytes):
-        try:
-            return json.loads(raw.decode("utf-8"))
-        except Exception:
-            return None
-
-    @property
-    def ok(self) -> bool:
-        return all(r[0] for r in self.results)
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import office_api_check as api  # noqa: E402 -- cookie sesi + CSRF + Origin
 
 
-def states_of(base: str) -> dict:
-    """status -> {agent_id: state} dari /api/agents."""
-    req = urllib.request.Request(base + "/api/agents", headers={"Accept": "*/*"})
-    with urllib.request.urlopen(req, timeout=15) as res:
-        data = json.loads(res.read().decode("utf-8"))
-    return {a["id"]: a.get("state") for a in data.get("agents", [])}
+class Checker(api.Checker):
+    """Klien sesi dari office_api_check; bentuk balikan (status, body)."""
+
+    def get(self, path: str, anon: bool = False):
+        status, _, raw = super().get(path, anon)
+        return status, raw
+
+    def post(self, path: str, payload, **kw):
+        status, _, raw = super().post(path, payload, **kw)
+        return status, raw
 
 
-def seats_of(base: str) -> dict:
+def _agents(c: Checker) -> list[dict]:
+    status, raw = c.get("/api/agents")
+    if status != 200:
+        raise RuntimeError(f"/api/agents HTTP {status}")
+    return (c.json_of(raw) or {}).get("agents", [])
+
+
+def states_of(c: Checker) -> dict:
+    """{agent_id: state} dari /api/agents."""
+    return {a["id"]: a.get("state") for a in _agents(c)}
+
+
+def seats_of(c: Checker) -> dict:
     """{agent_id: seat index} untuk agent berstatus meeting."""
-    req = urllib.request.Request(base + "/api/agents", headers={"Accept": "*/*"})
-    with urllib.request.urlopen(req, timeout=15) as res:
-        data = json.loads(res.read().decode("utf-8"))
-    return {a["id"]: a.get("meeting_seat") for a in data.get("agents", [])
-            if a.get("state") == "meeting"}
+    return {a["id"]: a.get("meeting_seat") for a in _agents(c) if a.get("state") == "meeting"}
 
 
 def main(argv=None) -> int:
@@ -99,12 +73,17 @@ def main(argv=None) -> int:
     parser.add_argument("--vault", default="", help="root vault yang dipakai server (untuk cek file)")
     parser.add_argument("--participants", default="eng,hrd,eng/workers/script-runner",
                         help="daftar id agent peserta rapat (pisahkan dengan koma)")
+    parser.add_argument("--password", default=os.environ.get("HERMES_OFFICE_PASSWORD", ""),
+                        help="password admin kalau server memakai auth")
     parser.add_argument("--keep", action="store_true", help="jangan hapus board/meeting.json di akhir")
     parser.add_argument("--json", default="", help="tulis hasil ke file JSON")
     args = parser.parse_args(argv)
 
     c = Checker(args.base)
     started = time.time()
+    if not api.login(c, args.password):
+        c.check("login (--password / HERMES_OFFICE_PASSWORD)", False, "server memakai auth")
+        return 1
     meeting_file = Path(args.vault) / "board" / "meeting.json" if args.vault else None
     participants = [p.strip() for p in args.participants.split(",") if p.strip()]
 
@@ -185,8 +164,8 @@ def main(argv=None) -> int:
     c.check("jalur ke kursi tidak memotong meja", not bad_path, ",".join(bad_path[:4]) or "ok")
 
     # --- baseline ----------------------------------------------------------
-    baseline = states_of(args.base)
-    c.check("snapshot awal punya 17 agent", len(baseline) == 17, f"n={len(baseline)}")
+    baseline = states_of(c)
+    c.check("snapshot awal berisi agent", len(baseline) >= len(participants), f"n={len(baseline)}")
     c.data["baseline"] = baseline
 
     # --- POST /api/meeting/start ------------------------------------------
@@ -209,7 +188,7 @@ def main(argv=None) -> int:
                     raw_file.get("participants") == participants,
                     json.dumps(raw_file)[:160])
 
-    after = states_of(args.base)
+    after = states_of(c)
     c.data["after_start"] = after
     meeting_states = {k: v for k, v in after.items() if v == "meeting"}
     c.check("semua peserta berstatus meeting",
@@ -224,7 +203,7 @@ def main(argv=None) -> int:
             len(unchanged) == len(baseline) - len(participants),
             f"{len(unchanged)}/{len(baseline) - len(participants)} tetap")
 
-    seat_map = seats_of(args.base)
+    seat_map = seats_of(c)
     c.check("setiap peserta dapat index kursi",
             all(seat_map.get(p) is not None for p in participants),
             json.dumps(seat_map))
@@ -253,7 +232,7 @@ def main(argv=None) -> int:
     body = c.json_of(raw) or {}
     c.check("POST /api/meeting/end -> 200", status == 200, f"HTTP {status}")
     c.check("end menutup rapat", body.get("meeting") is None, json.dumps(body.get("ended"))[:120])
-    reverted = states_of(args.base)
+    reverted = states_of(c)
     c.data["after_end"] = reverted
     same = [p for p in participants if reverted.get(p) == baseline.get(p)]
     c.check("status peserta kembali ke status sebelumnya",
@@ -267,7 +246,7 @@ def main(argv=None) -> int:
             "status": "active", "topic": "manual", "participants": participants[:1],
         }, ensure_ascii=False, indent=2), encoding="utf-8")
         time.sleep(1.3)
-        manual = states_of(args.base)
+        manual = states_of(c)
         c.check("file manual mengaktifkan status meeting",
                 manual.get(participants[0]) == "meeting",
                 f"{participants[0]}={manual.get(participants[0])}")
@@ -276,7 +255,7 @@ def main(argv=None) -> int:
             "status": "done", "topic": "manual", "participants": participants[:1],
         }, ensure_ascii=False, indent=2), encoding="utf-8")
         time.sleep(1.3)
-        done = states_of(args.base)
+        done = states_of(c)
         c.check("status=done mengembalikan status lama",
                 done.get(participants[0]) == baseline.get(participants[0]),
                 f"{participants[0]}={done.get(participants[0])} (sebelumnya {baseline.get(participants[0])})")
@@ -288,7 +267,7 @@ def main(argv=None) -> int:
         c.check("POST /api/meeting/end {remove:true} -> 200", status == 200, f"HTTP {status}")
         c.check("file board/meeting.json dihapus", not meeting_file.exists(), str(meeting_file))
         time.sleep(1.3)
-        gone = states_of(args.base)
+        gone = states_of(c)
         c.check("semua peserta kembali ke status awal setelah remove",
                 all(gone.get(p) == baseline.get(p) for p in participants),
                 json.dumps({p: gone.get(p) for p in participants}))

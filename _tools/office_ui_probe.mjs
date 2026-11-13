@@ -26,8 +26,7 @@ if (args.help) {
   --click AGENT_ID     klik meja agent itu (lewat koordinat layar)
   --dispatch TARGET    kirim form dispatch ke agent TARGET (menulis file!)
   --goal TEXT          goal untuk --dispatch (default: teks uji)
-  --static             uji mode statis (API mati): harapkan 16 meja tanpa data live
-  --expect N           jumlah meja yang diharapkan (default 16)
+  --expect N           jumlah meja yang diharapkan (default: sama dengan jumlah meja 3D)
   --audit SECONDS      audit navigasi selama N detik: cek agent tidak pernah
                        berada di dalam dinding / keluar playground
   --soak SECONDS       biarkan UI hidup N detik untuk menangkap error SSE/poll
@@ -40,7 +39,8 @@ if (!args.url) {
 }
 
 const cdpHost = args.cdp || '127.0.0.1:9222';
-const expectDesks = Number(args.expect || 16);
+// 0 = roster dinamis: cukup konsisten (meja 3D = baris roster = opsi dispatch).
+let expectDesks = Number(args.expect || 0);
 const timeoutMs = Number(args.timeout || 20000);
 
 async function main() {
@@ -165,17 +165,13 @@ async function main() {
 
   check('WebGL context aktif', probe.webgl.ok, probe.webgl.renderer || 'tidak ada context');
   check('tidak ada layar fatal', !probe.fatalVisible, probe.fatalText || '-');
-  check(`meja agent = ${expectDesks}`, probe.desks === expectDesks, 'desks=' + probe.desks);
+  if (!expectDesks) expectDesks = probe.desks;
+  check(`meja agent = ${expectDesks}`, probe.desks === expectDesks && probe.desks > 0, 'desks=' + probe.desks);
   check('roster menampilkan semua agent', probe.rosterRows === expectDesks, 'rows=' + probe.rosterRows);
   check('canvas punya ukuran', !!(probe.canvas && probe.canvas.w > 0 && probe.canvas.h > 0),
     probe.canvas ? `${probe.canvas.w}x${probe.canvas.h}` : 'tanpa canvas');
-  if (args.static) {
-    check('mode statis saat API mati', probe.mode === 'off', 'mode=' + probe.mode);
-    check('dispatch dinonaktifkan di mode statis', /butuh server/i.test(probe.staticFallback), probe.staticFallback);
-  } else {
-    check('data live dari server', probe.mode === 'live' || probe.mode === 'poll', 'mode=' + probe.mode);
-    check('dropdown dispatch terisi', probe.targetOptions === expectDesks, 'options=' + probe.targetOptions);
-  }
+  check('data live dari server', probe.mode === 'live' || probe.mode === 'poll', 'mode=' + probe.mode);
+  check('dropdown dispatch terisi', probe.targetOptions === expectDesks, 'options=' + probe.targetOptions);
 
   let clickResult = null;
   if (args.click) {
