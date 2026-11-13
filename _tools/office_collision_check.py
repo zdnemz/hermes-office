@@ -219,14 +219,7 @@ def check() -> dict:
         if not aisle:
             add("lorong-tidak-ada", room["id"])
             continue
-        nav = room.get("nav") or {}
-        aisle_node = office.NAV_NODES.get(nav.get("aisle"))
-        if aisle_node is None:
-            add("node-lorong-hilang", room["id"])
-            continue
-        if abs(aisle_node[0] - aisle["x"]) > 0.01 or abs(aisle_node[1] - aisle["z"]) > 0.01:
-            add("node-lorong-tidak-sesuai",
-                f"{room['id']} node {aisle_node} vs ruangan {aisle}")
+        aisle_node = (aisle["x"], aisle["z"])
 
         # (7) rute agent: pintu -> lorong -> berdiri -> duduk
         door = room.get("door")
@@ -282,7 +275,14 @@ def main(argv=None) -> int:
     parser.add_argument("--quiet", action="store_true", help="cetak ringkasan saja")
     args = parser.parse_args(argv)
 
-    result = check()
+    default = check()
+    office.use_layout(office.build_layout(office.stress_roster()))
+    stress = check()
+    office.use_layout(office.DEFAULT_LAYOUT)
+    for r, name in ((default, "bawaan"), (stress, "stress: meluap + 3 departemen baru")):
+        print(f"[{name}] masalah={len(r['problems'])}")
+    result = dict(stress, problems=default["problems"] + stress["problems"],
+                  ok=default["ok"] and stress["ok"], default=default)
     if args.json_path:
         Path(args.json_path).write_text(json.dumps(result, indent=2, ensure_ascii=False) + "\n",
                                         encoding="utf-8")

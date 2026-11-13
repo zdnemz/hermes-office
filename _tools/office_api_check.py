@@ -4,11 +4,17 @@
 Menguji server yang SUDAH berjalan (tidak menyalakan/mematikan apa pun) dan
 mencetak satu baris PASS/FAIL per cek. Exit 0 kalau semua lolos.
 
-Aman dijalankan ke vault asli: satu-satunya POST yang dikirim memakai
-dry_run=true, jadi tidak ada file tugas yang dibuat.
+Aman dijalankan ke vault asli: satu-satunya POST tugas memakai dry_run=true,
+jadi tidak ada file tugas yang dibuat.
+
+Kalau server memakai password, berikan lewat --password atau env
+HERMES_OFFICE_PASSWORD. Cek auth (redirect, 401, CSRF, Origin) hanya jalan
+kalau auth aktif. Satu login salah sengaja dikirim (memakai 1 dari 5 jatah;
+direset oleh login yang benar sesudahnya).
 
 Contoh:
   python3 _tools/office_api_check.py --base http://127.0.0.1:3000
+  HERMES_OFFICE_PASSWORD=... python3 _tools/office_api_check.py --base https://office.example.com
   python3 _tools/office_api_check.py --base http://127.0.0.1:3010 \
       --json /opt/data/cache/scratch/api-check.json --sse
 """
@@ -16,7 +22,9 @@ Contoh:
 from __future__ import annotations
 
 import argparse
+import http.cookiejar
 import json
+import os
 import sys
 import time
 import urllib.error
@@ -24,11 +32,28 @@ import urllib.parse
 import urllib.request
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):  # noqa: D401 - kembalikan 3xx apa adanya
+        return None
+
+
 class Checker:
     def __init__(self, base: str):
         self.base = base.rstrip("/")
         self.results: list[tuple[bool, str, str]] = []
         self.data: dict = {}
+        self.jar = http.cookiejar.CookieJar()
+        self.opener = urllib.request.build_opener(
+            urllib.request.HTTPCookieProcessor(self.jar), _NoRedirect())
+        self.anon = urllib.request.build_opener(_NoRedirect())
+        self.csrf = ""
+
+    def _open(self, req, opener=None, timeout=15):
+        try:
+            with (opener or self.opener).open(req, timeout=timeout) as res:
+                return res.status, dict(res.headers), res.read()
+        except urllib.error.HTTPError as exc:
+            return exc.code, dict(exc.headers), exc.read()
 
     def check(self, name: str, condition: bool, detail: str = "") -> bool:
         self.results.append((bool(condition), name, detail))
@@ -36,25 +61,19 @@ class Checker:
         print(f"[{mark}] {name}" + (f" -- {detail}" if detail else ""))
         return bool(condition)
 
-    def get(self, path: str):
+    def get(self, path: str, anon: bool = False):
         req = urllib.request.Request(self.base + path, headers={"Accept": "*/*"})
-        try:
-            with urllib.request.urlopen(req, timeout=15) as res:
-                return res.status, dict(res.headers), res.read()
-        except urllib.error.HTTPError as exc:
-            return exc.code, dict(exc.headers), exc.read()
+        return self._open(req, self.anon if anon else None)
 
-    def post(self, path: str, payload: dict):
-        body = json.dumps(payload).encode()
-        req = urllib.request.Request(
-            self.base + path, data=body,
-            headers={"Content-Type": "application/json"}, method="POST",
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=30) as res:
-                return res.status, dict(res.headers), res.read()
-        except urllib.error.HTTPError as exc:
-            return exc.code, dict(exc.headers), exc.read()
+    def post(self, path: str, payload, csrf: str | None = None, origin: str | None = None,
+             raw: bytes | None = None):
+        body = raw if raw is not None else json.dumps(payload).encode()
+        headers = {"Content-Type": "application/json", "Origin": origin or self.base}
+        token = self.csrf if csrf is None else csrf
+        if token:
+            headers["X-CSRF-Token"] = token
+        req = urllib.request.Request(self.base + path, data=body, headers=headers, method="POST")
+        return self._open(req, timeout=30)
 
     def json_of(self, raw: bytes):
         try:
@@ -67,18 +86,70 @@ class Checker:
         return all(r[0] for r in self.results)
 
 
+def login(c: Checker, password: str) -> bool:
+    """Login kalau server memakai auth; True kalau siap dipakai."""
+    status, _, _ = Checker.get(c, "/api/session")
+    if status != 401:
+        return True
+    status, _, raw = Checker.post(c, "/api/login", {"password": password})
+    c.csrf = (c.json_of(raw) or {}).get("csrf", "")
+    return status == 200
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--base", default="http://127.0.0.1:3000")
-    parser.add_argument("--expect-agents", type=int, default=16)
-    parser.add_argument("--expect-departments", type=int, default=5)
-    parser.add_argument("--expect-rooms", type=int, default=7)
+    parser.add_argument("--password", default=os.environ.get("HERMES_OFFICE_PASSWORD", ""),
+                        help="password admin (default: env HERMES_OFFICE_PASSWORD)")
+    parser.add_argument("--expect-agents", type=int, default=0, help="0 = cukup konsisten antar endpoint")
+    parser.add_argument("--expect-rooms", type=int, default=11)
     parser.add_argument("--sse", action="store_true", help="uji /api/stream menerima minimal satu event")
     parser.add_argument("--json", default="", help="tulis hasil ke file JSON")
     args = parser.parse_args(argv)
 
     c = Checker(args.base)
     started = time.time()
+
+    # --- auth -------------------------------------------------------------
+    status, _, raw = c.get("/api/session", anon=True)
+    auth_on = status == 401
+    c.data["auth"] = auth_on
+    print(f"(auth {'aktif' if auth_on else 'mati: demo di loopback'})")
+    if auth_on:
+        status, headers, _ = c.get("/", anon=True)
+        c.check("tanpa sesi: GET / -> 302 /login", status == 302 and headers.get("Location", "").endswith("/login"),
+                f"HTTP {status} {headers.get('Location')}")
+        for path in ("/api/agents", "/api/layout", "/api/stream", "/app.js"):
+            status, _, _ = c.get(path, anon=True)
+            c.check(f"tanpa sesi: {path} ditolak", status in (401, 302), f"HTTP {status}")
+        status, _, raw = c.get("/api/health", anon=True)
+        c.check("tanpa sesi: health tidak membocorkan detail", c.json_of(raw) == {"status": "ok"},
+                raw[:80].decode("utf-8", "replace"))
+        status, _, _ = c.get("/login", anon=True)
+        c.check("halaman /login publik", status == 200, f"HTTP {status}")
+        status, _, raw = c.post("/api/login", {"password": "pasti-salah-" + str(time.time())})
+        c.check("password salah -> 401", status == 401, f"HTTP {status}")
+        if not args.password:
+            c.check("password tersedia (--password / HERMES_OFFICE_PASSWORD)", False,
+                    "cek berikutnya butuh login")
+            return finish(c, args, started)
+        status, headers, raw = c.post("/api/login", {"password": args.password},
+                                      origin="https://evil.example")
+        c.check("login dari origin asing -> 403", status == 403, f"HTTP {status}")
+        status, headers, raw = c.post("/api/login", {"password": args.password})
+        body = c.json_of(raw) or {}
+        cookie = headers.get("Set-Cookie", "")
+        c.check("login benar -> 200 + csrf", status == 200 and bool(body.get("csrf")), f"HTTP {status}")
+        c.check("cookie sesi HttpOnly + SameSite=Strict",
+                "HttpOnly" in cookie and "SameSite=Strict" in cookie, cookie.split(";", 1)[-1].strip())
+        c.csrf = body.get("csrf", "")
+        status, _, _ = c.post("/api/task", {"to": "x", "goal": "tanpa csrf"}, csrf="")
+        c.check("POST tanpa CSRF -> 403", status == 403, f"HTTP {status}")
+        status, _, _ = c.post("/api/task", {"to": "x", "goal": "csrf salah"}, csrf="salah")
+        c.check("POST dengan CSRF salah -> 403", status == 403, f"HTTP {status}")
+    status, _, raw = c.get("/api/session")
+    sess = c.json_of(raw) or {}
+    c.check("GET /api/session -> 200", status == 200 and sess.get("authenticated") is True, f"HTTP {status}")
 
     # --- health -----------------------------------------------------------
     status, headers, raw = c.get("/api/health")
@@ -87,16 +158,15 @@ def main(argv=None) -> int:
     c.check("GET /api/health -> 200", status == 200, f"HTTP {status}")
     c.check("health.status == ok", health.get("status") == "ok", str(health.get("status")))
     counts = health.get("counts") or {}
-    c.check(f"health melaporkan {args.expect_agents} agent", counts.get("agents") == args.expect_agents,
-            f"agents={counts.get('agents')}")
-    c.check(f"health melaporkan {args.expect_departments} departemen",
-            counts.get("departments") == args.expect_departments, f"departments={counts.get('departments')}")
     c.check("content-type health JSON", "application/json" in headers.get("Content-Type", ""),
             headers.get("Content-Type", ""))
     c.check("cache-control: no-store pada API", "no-store" in headers.get("Cache-Control", ""),
             headers.get("Cache-Control", ""))
-    c.check("CORS header ada", headers.get("Access-Control-Allow-Origin") == "*",
+    c.check("tanpa header CORS (same-origin saja)", "Access-Control-Allow-Origin" not in headers,
             str(headers.get("Access-Control-Allow-Origin")))
+    for name, needle in [("Content-Security-Policy", "default-src 'self'"),
+                         ("X-Content-Type-Options", "nosniff"), ("X-Frame-Options", "DENY")]:
+        c.check(f"header {name}", needle in headers.get(name, ""), headers.get(name, "")[:60])
 
     # --- layout -----------------------------------------------------------
     status, _, raw = c.get("/api/layout")
@@ -106,12 +176,20 @@ def main(argv=None) -> int:
     agents = layout.get("agents") or []
     depts = layout.get("departments") or []
     c.check("GET /api/layout -> 200", status == 200, f"HTTP {status}")
-    c.check(f"{args.expect_rooms} zona ruangan", len(rooms) == args.expect_rooms, f"rooms={len(rooms)}")
-    c.check(f"{args.expect_agents} meja agent", len(agents) == args.expect_agents, f"agents={len(agents)}")
-    c.check(f"{args.expect_departments} departemen non-executive",
-            len([d for d in depts if d.get("id") != "executive"]) == args.expect_departments,
+    annex = [r for r in rooms if r.get("annex")]
+    c.check(f"{args.expect_rooms} ruangan bawaan + annex", len(rooms) - len(annex) == args.expect_rooms,
+            f"rooms={len(rooms)} annex={len(annex)}")
+    n_agents = args.expect_agents or counts.get("agents")
+    c.check(f"layout berisi {n_agents} agent (sama dengan health)", len(agents) == n_agents,
+            f"agents={len(agents)}")
+    c.check("jumlah departemen konsisten dengan health",
+            len([d for d in depts if d.get("id") != "executive"]) == counts.get("departments"),
             "depts=" + ",".join(d.get("id", "?") for d in depts))
+    c.check("layout punya version", bool(layout.get("version")), str(layout.get("version")))
     c.check("id agent unik", len({a.get("id") for a in agents}) == len(agents))
+    hot = [a for a in agents if a.get("hot_desk")]
+    c.check("hot desk hanya di library", all(a.get("room") == "library" for a in hot),
+            f"{len(hot)} agent hot desk")
 
     room_by_id = {r["id"]: r for r in rooms}
     outside = []
@@ -123,7 +201,8 @@ def main(argv=None) -> int:
         x, _, z = a.get("pos") or (0, 0, 0)
         if abs(x - r["x"]) > r["w"] / 2 - 0.8 or abs(z - r["z"]) > r["d"] / 2 - 0.5:
             outside.append(f"{a.get('id')} di ({x},{z}) keluar dari {r['id']}")
-    c.check("semua meja berada di dalam ruangannya", not outside, "; ".join(outside) or "16/16 ok")
+    c.check("semua meja berada di dalam ruangannya", not outside,
+            "; ".join(outside) or f"{len(agents)}/{len(agents)} ok")
 
     # --- snapshot ---------------------------------------------------------
     status, _, raw = c.get("/api/agents")
@@ -131,7 +210,10 @@ def main(argv=None) -> int:
     c.data["agents"] = snap
     live = snap.get("agents") or []
     c.check("GET /api/agents -> 200", status == 200, f"HTTP {status}")
-    c.check(f"snapshot berisi {args.expect_agents} agent", len(live) == args.expect_agents, f"n={len(live)}")
+    c.check(f"snapshot berisi {n_agents} agent", len(live) == n_agents, f"n={len(live)}")
+    c.check("snapshot punya events & layout_version",
+            isinstance(snap.get("events"), list) and bool(snap.get("layout_version")))
+    c.check("snapshot tidak membocorkan path vault", "vault" not in snap, ",".join(sorted(snap)[:12]))
     bad_state = [a["id"] for a in live if a.get("state") not in ("idle", "working", "blocked", "meeting")]
     c.check("state hanya idle/working/blocked/meeting", not bad_state, ",".join(bad_state) or "ok")
     meeting_ids = set((snap.get("meeting") or {}).get("participants") or [])
@@ -174,6 +256,20 @@ def main(argv=None) -> int:
     c.check("endpoint API tak dikenal -> 404 JSON", status == 404 and isinstance(body, dict),
             f"HTTP {status}")
 
+    # --- file tugas -------------------------------------------------------
+    with_task = next((a for a in live if a.get("open_tasks") or a.get("done_tasks")), None)
+    if with_task:
+        name = (with_task.get("open_tasks") or with_task.get("done_tasks"))[0]
+        q = urllib.parse.urlencode({"agent": with_task["id"], "name": name})
+        status, _, raw = c.get("/api/task-file?" + q)
+        c.check("GET /api/task-file -> isi markdown", status == 200 and bool((c.json_of(raw) or {}).get("content")),
+                f"{with_task['id']}/{name} HTTP {status}")
+        q = urllib.parse.urlencode({"agent": with_task["id"], "name": "../../AGENTS.md"})
+        status, _, _ = c.get("/api/task-file?" + q)
+        c.check("task-file menolak path traversal", status in (400, 404), f"HTTP {status}")
+    status, _, _ = c.get("/..%2f..%2fetc/passwd")
+    c.check("static menolak traversal", status in (400, 403, 404), f"HTTP {status}")
+
     # --- task validation (dry_run, tidak menulis) -------------------------
     status, _, raw = c.post("/api/task", {"to": "eng/workers/script-runner", "goal": "uji kontrak api dry run", "dry_run": True})
     dry = c.json_of(raw) or {}
@@ -198,17 +294,34 @@ def main(argv=None) -> int:
     status, headers, raw = c.post("/api/task", {"to": "x"})
     c.check("body tanpa field wajib ditolak", status == 400, f"HTTP {status}")
 
-    # JSON rusak (bukan sekadar field kosong)
-    try:
-        req = urllib.request.Request(
-            c.base + "/api/task", data=b"{bukan json",
-            headers={"Content-Type": "application/json"}, method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=10) as res:
-            bad_status = res.status
-    except urllib.error.HTTPError as exc:
-        bad_status = exc.code
+    bad_status, _, _ = c.post("/api/task", None, raw=b"{bukan json")
     c.check("JSON rusak ditolak dengan 400", bad_status == 400, f"HTTP {bad_status}")
+
+    # --- editor denah (dry_run: tidak menulis) ---------------------------
+    status, _, raw = c.get("/api/office-layout")
+    ol = c.json_of(raw) or {}
+    c.check("GET /api/office-layout -> doc + katalog", status == 200 and "doc" in ol and len(ol.get("catalog", {})) >= 10,
+            f"HTTP {status} jenis={len(ol.get('catalog', {}))}")
+    desk = next((d for r in rooms for d in r.get("desks", []) if r.get("kind") == "department"), None)
+    if desk:
+        bad_doc = {"props": [{"id": "p-check1", "type": "planter", "x": desk["x"], "z": desk["z"], "rot": 0}]}
+        status, _, raw = c.post("/api/office-layout", {"doc": bad_doc, "dry_run": True})
+        c.check("perabot di atas meja ditolak 400", status == 400, f"HTTP {status} {(c.json_of(raw) or {}).get('error', '')[:60]}")
+    status, _, raw = c.post("/api/office-layout", {"doc": {"rooms": [
+        {"id": "x1", "kind": "ruang-aneh", "x": 0, "z": 0, "w": 6, "d": 6}]}, "dry_run": True})
+    c.check("jenis ruangan tidak dikenal ditolak 400", status == 400, f"HTTP {status}")
+    doc_rooms = (ol.get("doc") or {}).get("rooms") or []
+    if len(doc_rooms) > 1:
+        clash = [dict(doc_rooms[0])] + [dict(doc_rooms[1], x=doc_rooms[0]["x"], z=doc_rooms[0]["z"])] + doc_rooms[2:]
+        status, _, raw = c.post("/api/office-layout", {"doc": {"rooms": clash}, "dry_run": True})
+        c.check("ruangan saling menimpa ditolak 400", status == 400 and "menimpa" in (c.json_of(raw) or {}).get("error", ""),
+                f"HTTP {status}")
+    status, _, raw = c.post("/api/office-layout", {"doc": ol.get("doc", {}), "preview": True})
+    c.check("preview mengembalikan denah jadi", status == 200 and bool(((c.json_of(raw) or {}).get("layout") or {}).get("rooms")),
+            f"HTTP {status}")
+    status, _, raw = c.post("/api/office-layout", {"doc": ol.get("doc", {}), "dry_run": True})
+    c.check("dokumen denah saat ini valid (dry_run)", status == 200 and (c.json_of(raw) or {}).get("dry_run") is True,
+            f"HTTP {status}")
 
     # --- meeting -----------------------------------------------------------
     status, _, raw = c.get("/api/meeting")
@@ -224,8 +337,8 @@ def main(argv=None) -> int:
     html = raw.decode("utf-8", "replace")
     c.data["index_bytes"] = len(raw)
     c.check("GET / -> 200", status == 200, f"HTTP {status} {len(raw)} B")
-    c.check("index memuat stream & vendor lokal",
-            "/api/stream" in html and "/vendor/three.min.js" in html)
+    c.check("index memuat app.js & vendor lokal",
+            "/app.js" in html and "/vendor/three.min.js" in html)
     c.check("index tidak di-cache", "no-cache" in headers.get("Cache-Control", ""),
             headers.get("Cache-Control", ""))
 
@@ -244,7 +357,7 @@ def main(argv=None) -> int:
         got = []
         try:
             req = urllib.request.Request(c.base + "/api/stream")
-            with urllib.request.urlopen(req, timeout=10) as res:
+            with c.opener.open(req, timeout=10) as res:
                 c.check("GET /api/stream -> 200 event-stream", res.status == 200,
                         f"HTTP {res.status} {res.headers.get('Content-Type')}")
                 deadline = time.time() + 6
@@ -262,7 +375,14 @@ def main(argv=None) -> int:
                     "counts" in got[0] and "agents" in got[0])
             c.data["sse_first"] = {"counts": got[0].get("counts"), "sig_len": len(got[0].get("generated_at", ""))}
 
-    # --- ringkasan --------------------------------------------------------
+    if auth_on:
+        status, _, _ = c.post("/api/logout", {})
+        status2, _, _ = c.get("/api/agents")
+        c.check("logout mencabut sesi", status == 200 and status2 == 401, f"logout {status}, lalu {status2}")
+    return finish(c, args, started)
+
+
+def finish(c: Checker, args, started: float) -> int:
     passed = sum(1 for r in c.results if r[0])
     total = len(c.results)
     elapsed = round(time.time() - started, 2)

@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="id">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex, nofollow">
+  <title>Masuk · Hermes Office</title>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/tokens.css">
+  <link rel="stylesheet" href="/login.css">
+  <script src="/login.js" defer></script>
+</head>
+<body>
+  <main class="shell">
+    <section class="form-side">
+      <div class="brand">
+        <img src="/favicon.svg" alt="" width="28" height="28">
+        <span>Hermes Office</span>
+      </div>
+
+      <div class="form-wrap">
+        <h1>Masuk ke kantor</h1>
+        <p class="lede">Dashboard 3D untuk memantau agent Hermes, membagi tugas, dan memulai rapat.</p>
+
+        <form id="login-form" novalidate>
+          <div class="field">
+            <label for="password">Password admin</label>
+            <div class="pw">
+              <input id="password" name="password" type="password" autocomplete="current-password"
+                     required aria-describedby="password-help password-err" spellcheck="false">
+              <button type="button" id="toggle-pw" class="pw-toggle" aria-controls="password"
+                      aria-pressed="false">Tampilkan</button>
+            </div>
+            <p id="password-help" class="help">Diatur lewat HERMES_OFFICE_PASSWORD atau --password-file di server.</p>
+            <p id="password-err" class="err" role="alert"></p>
+          </div>
+          <button type="submit" id="submit" class="btn-primary"><span>Masuk</span></button>
+        </form>
+
+        <p class="note">Sesi berlaku 12 jam. Setelah 5 percobaan gagal, login dikunci 15 menit.</p>
+      </div>
+    </section>
+
+    <aside class="art-side" aria-hidden="true">
+      <svg class="plan" viewBox="0 0 400 300" role="presentation">
+        <g class="walls">
+          <rect x="20" y="20" width="360" height="260" rx="6"/>
+          <rect x="30" y="30" width="80" height="70" rx="3"/>
+          <rect x="120" y="30" width="80" height="70" rx="3"/>
+          <rect x="210" y="30" width="80" height="70" rx="3"/>
+          <rect x="300" y="30" width="70" height="70" rx="3"/>
+          <rect x="30" y="200" width="80" height="70" rx="3"/>
+          <rect x="120" y="200" width="80" height="70" rx="3"/>
+          <rect x="300" y="130" width="70" height="140" rx="3"/>
+        </g>
+        <g class="plaza">
+          <rect x="120" y="115" width="170" height="70" rx="4"/>
+        </g>
+        <g class="desks">
+          <rect x="45" y="50" width="18" height="10"/><rect x="75" y="50" width="18" height="10"/>
+          <rect x="135" y="50" width="18" height="10"/><rect x="165" y="50" width="18" height="10"/>
+          <rect x="225" y="50" width="18" height="10"/><rect x="255" y="50" width="18" height="10"/>
+          <rect x="45" y="225" width="18" height="10"/><rect x="135" y="225" width="18" height="10"/>
+          <rect x="325" y="160" width="20" height="80" rx="2"/>
+        </g>
+        <path class="route" d="M54 75 V108 H160 V150 H240 V108 H335 V150"/>
+        <circle class="a idle" cx="160" cy="150" r="5"/>
+        <circle class="a working" cx="54" cy="66" r="5"/>
+        <circle class="a working" cx="234" cy="66" r="5"/>
+        <circle class="a blocked" cx="144" cy="241" r="5"/>
+        <circle class="a meeting" cx="335" cy="150" r="5"/>
+        <circle class="a idle" cx="250" cy="165" r="5"/>
+        <circle class="walker" r="5"><animateMotion dur="9s" repeatCount="indefinite" path="M54 75 V108 H160 V150 H240 V108 H335 V150"/></circle>
+      </svg>
+      <ul class="legend">
+        <li><span class="dot idle"></span>santai</li>
+        <li><span class="dot working"></span>bekerja</li>
+        <li><span class="dot blocked"></span>terhambat</li>
+        <li><span class="dot meeting"></span>rapat</li>
+      </ul>
+    </aside>
+  </main>
+</body>
+</html>
